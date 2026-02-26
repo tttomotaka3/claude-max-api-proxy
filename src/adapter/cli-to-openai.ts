@@ -25,20 +25,37 @@ export function parseToolUseBlocks(text: string): ParsedToolResponse {
   const toolUseRegex = /<tool_use>\s*([\s\S]*?)\s*<\/tool_use>/g;
   const cleanedText = text.replace(toolUseRegex, (_, jsonStr: string) => {
     try {
-      const parsed = JSON.parse(jsonStr.trim());
-      const name = parsed.name;
-      const args = parsed.arguments || {};
+      // Normalize: remove newlines/indentation that Haiku may insert
+      let normalized = jsonStr.trim().replace(/\n\s*/g, " ");
+
+      // Strip markdown code fences if Haiku wraps in ```json ... ```
+      normalized = normalized.replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
+
+      const parsed = JSON.parse(normalized);
+
+      // Validate required field
+      if (!parsed.name || typeof parsed.name !== "string") {
+        console.error("[tool_use parse] Missing or invalid 'name' field:", normalized.slice(0, 200));
+        return `<tool_use>${jsonStr}</tool_use>`;
+      }
+
+      // Handle double-stringified arguments (Haiku sometimes wraps in extra quotes)
+      let args = parsed.arguments || {};
+      if (typeof args === "string") {
+        try { args = JSON.parse(args); } catch { /* use as-is */ }
+      }
+
       toolCalls.push({
         id: `call_${Date.now()}_${callIndex}`,
         type: "function",
         function: {
-          name,
+          name: parsed.name,
           arguments: JSON.stringify(args),
         },
       });
       callIndex++;
-    } catch {
-      // Failed to parse — leave in text as-is
+    } catch (e) {
+      console.error("[tool_use parse] Failed to parse tool_use block:", jsonStr.slice(0, 200), e);
       return `<tool_use>${jsonStr}</tool_use>`;
     }
     return ""; // Remove successfully parsed tool_use from text
