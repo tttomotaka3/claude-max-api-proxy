@@ -52,9 +52,12 @@ export class ClaudeSubprocess extends EventEmitter {
     return new Promise((resolve, reject) => {
       try {
         // Use spawn() for security - no shell interpretation
+        // Remove CLAUDECODE env var to allow nested Claude Code sessions
+        const env = { ...process.env };
+        delete env.CLAUDECODE;
         this.process = spawn("claude", args, {
           cwd: options.cwd || process.cwd(),
-          env: { ...process.env },
+          env,
           stdio: ["pipe", "pipe", "pipe"],
         });
 
@@ -137,6 +140,8 @@ export class ClaudeSubprocess extends EventEmitter {
       "--model",
       options.model, // Model alias (opus/sonnet/haiku)
       "--no-session-persistence", // Don't save sessions
+      "--add-dir", "/Users/tt/.openclaw/workspace", // Allow workspace access
+      "--dangerously-skip-permissions", // Skip permission prompts (headless mode)
       prompt, // Pass prompt as argument (more reliable than stdin)
     ];
 
