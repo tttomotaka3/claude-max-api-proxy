@@ -32,6 +32,7 @@ export interface SubprocessEvents {
   error: (error: Error) => void;
   close: (code: number | null) => void;
   raw: (line: string) => void;
+  stderr: (text: string) => void;
 }
 
 const DEFAULT_TIMEOUT = 300000; // 5 minutes
@@ -97,13 +98,14 @@ export class ClaudeSubprocess extends EventEmitter {
           this.processBuffer();
         });
 
-        // Capture stderr for debugging
+        // Capture stderr for debugging and rate-limit detection
         this.process.stderr?.on("data", (chunk: Buffer) => {
           const errorText = chunk.toString().trim();
           if (errorText) {
             // Don't emit as error unless it's actually an error
             // Claude CLI may write debug info to stderr
             console.error("[Subprocess stderr]:", errorText.slice(0, 200));
+            this.emit("stderr", errorText);
           }
         });
 
