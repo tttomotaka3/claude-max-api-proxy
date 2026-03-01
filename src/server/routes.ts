@@ -40,9 +40,20 @@ const AUTH_ERROR_PATTERNS = [
   /run \/login/i,
 ];
 
+const PROMPT_TOO_LONG_PATTERNS = [
+  /prompt is too long/i,
+  /context.*limit/i,
+  /context.*exceeded/i,
+  /context window.*full/i,
+  /too many tokens/i,
+  /maximum context length/i,
+];
+
 const DISCORD_GENERAL_CHANNEL = "1475509846672674896";
 const AUTH_ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 min
 let lastAuthAlertAt = 0;
+const PROMPT_TOO_LONG_COOLDOWN_MS = 30 * 60 * 1000; // 30 min
+let lastPromptTooLongAlertAt = 0;
 
 function isRateLimitError(text: string): boolean {
   return RATE_LIMIT_PATTERNS.some((p) => p.test(text));
@@ -50,6 +61,10 @@ function isRateLimitError(text: string): boolean {
 
 function isAuthError(text: string): boolean {
   return AUTH_ERROR_PATTERNS.some((p) => p.test(text));
+}
+
+function isPromptTooLong(text: string): boolean {
+  return PROMPT_TOO_LONG_PATTERNS.some((p) => p.test(text));
 }
 
 function getDiscordBotToken(): string | null {
@@ -113,9 +128,50 @@ function notifyDiscordAuthError(message: string): void {
   req.end();
 }
 
+function notifyDiscordPromptTooLong(message: string): void {
+  const now = Date.now();
+  if (now - lastPromptTooLongAlertAt < PROMPT_TOO_LONG_COOLDOWN_MS) {
+    console.error("[PromptTooLongAlert] Cooldown active, skipping notification");
+    return;
+  }
+  lastPromptTooLongAlertAt = now;
+
+  const token = getDiscordBotToken();
+  if (!token) {
+    console.error("[PromptTooLongAlert] No Discord bot token available");
+    return;
+  }
+
+  const content = `⚠️ **Prompt is too long エラー検知**\nセッション履歴が長くなりすぎています。エージェントで \`/new\` を実行してセッションをリセットしてください。\n詳細: ${message.slice(0, 200)}`;
+  const postData = JSON.stringify({ content });
+  const options: https.RequestOptions = {
+    hostname: "discord.com",
+    port: 443,
+    path: `/api/v10/channels/${DISCORD_GENERAL_CHANNEL}/messages`,
+    method: "POST",
+    headers: {
+      "Authorization": `Bot ${token}`,
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(postData),
+    },
+  };
+
+  const req = https.request(options, (res) => {
+    res.on("data", () => {});
+    res.on("end", () => {
+      console.error(`[PromptTooLongAlert] Discord notification sent (status ${res.statusCode})`);
+    });
+  });
+  req.on("error", (err) => {
+    console.error("[PromptTooLongAlert] Failed to send Discord notification:", err.message);
+  });
+  req.write(postData);
+  req.end();
+}
+
 function writeErrorLog(
   requestId: string,
-  errorType: "rate_limit" | "auth_error" | "other",
+  errorType: "rate_limit" | "auth_error" | "prompt_too_long" | "other",
   message: string,
   model: string,
   stream: boolean,
@@ -336,6 +392,10 @@ async function handleStreamingResponse(
         console.error("[Streaming] Auth error detected in result:", result.result.slice(0, 200));
         writeErrorLog(requestId, "auth_error", result.result, lastModel, true, cliInput.sessionId, agent);
         notifyDiscordAuthError(result.result);
+      } else if (result.result && isPromptTooLong(result.result)) {
+        console.error("[Streaming] Prompt too long detected in result:", result.result.slice(0, 200));
+        writeErrorLog(requestId, "prompt_too_long", result.result, lastModel, true, cliInput.sessionId, agent);
+        notifyDiscordPromptTooLong(result.result);
       }
 
       if (hasTools) {
@@ -419,6 +479,10 @@ async function handleStreamingResponse(
         console.error("[Streaming] Auth error detected in stderr:", text.slice(0, 200));
         writeErrorLog(requestId, "auth_error", text, lastModel, true, cliInput.sessionId, agent);
         notifyDiscordAuthError(text);
+      } else if (isPromptTooLong(text)) {
+        console.error("[Streaming] Prompt too long detected in stderr:", text.slice(0, 200));
+        writeErrorLog(requestId, "prompt_too_long", text, lastModel, true, cliInput.sessionId, agent);
+        notifyDiscordPromptTooLong(text);
       } else if (isRateLimitError(text)) {
         console.error("[Streaming] Rate limit detected in stderr:", text.slice(0, 200));
         writeErrorLog(requestId, "rate_limit", text, lastModel, true, cliInput.sessionId, agent);
@@ -427,8 +491,9 @@ async function handleStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[Streaming] Error:", error.message);
-      const errorType = isAuthError(error.message) ? "auth_error" : isRateLimitError(error.message) ? "rate_limit" : "other";
+      const errorType = isAuthError(error.message) ? "auth_error" : isPromptTooLong(error.message) ? "prompt_too_long" : isRateLimitError(error.message) ? "rate_limit" : "other";
       if (errorType === "auth_error") notifyDiscordAuthError(error.message);
+      if (errorType === "prompt_too_long") notifyDiscordPromptTooLong(error.message);
       writeErrorLog(requestId, errorType, error.message, lastModel, true, cliInput.sessionId, agent);
       if (!res.writableEnded) {
         res.write(
@@ -486,6 +551,10 @@ async function handleNonStreamingResponse(
         console.error("[NonStreaming] Auth error detected in result:", result.result.slice(0, 200));
         writeErrorLog(requestId, "auth_error", result.result, "unknown", false, cliInput.sessionId, agent);
         notifyDiscordAuthError(result.result);
+      } else if (result.result && isPromptTooLong(result.result)) {
+        console.error("[NonStreaming] Prompt too long detected in result:", result.result.slice(0, 200));
+        writeErrorLog(requestId, "prompt_too_long", result.result, "unknown", false, cliInput.sessionId, agent);
+        notifyDiscordPromptTooLong(result.result);
       }
     });
 
@@ -494,6 +563,10 @@ async function handleNonStreamingResponse(
         console.error("[NonStreaming] Auth error detected in stderr:", text.slice(0, 200));
         writeErrorLog(requestId, "auth_error", text, "unknown", false, cliInput.sessionId, agent);
         notifyDiscordAuthError(text);
+      } else if (isPromptTooLong(text)) {
+        console.error("[NonStreaming] Prompt too long detected in stderr:", text.slice(0, 200));
+        writeErrorLog(requestId, "prompt_too_long", text, "unknown", false, cliInput.sessionId, agent);
+        notifyDiscordPromptTooLong(text);
       } else if (isRateLimitError(text)) {
         console.error("[NonStreaming] Rate limit detected in stderr:", text.slice(0, 200));
         writeErrorLog(requestId, "rate_limit", text, "unknown", false, cliInput.sessionId, agent);
@@ -502,8 +575,9 @@ async function handleNonStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[NonStreaming] Error:", error.message);
-      const errorType = isAuthError(error.message) ? "auth_error" : isRateLimitError(error.message) ? "rate_limit" : "other";
+      const errorType = isAuthError(error.message) ? "auth_error" : isPromptTooLong(error.message) ? "prompt_too_long" : isRateLimitError(error.message) ? "rate_limit" : "other";
       if (errorType === "auth_error") notifyDiscordAuthError(error.message);
+      if (errorType === "prompt_too_long") notifyDiscordPromptTooLong(error.message);
       writeErrorLog(requestId, errorType, error.message, "unknown", false, cliInput.sessionId, agent);
       res.status(500).json({
         error: {
