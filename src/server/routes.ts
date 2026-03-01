@@ -8,6 +8,7 @@ import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import * as fs from "fs";
 import * as path from "path";
+import * as https from "https";
 import { fileURLToPath } from "url";
 import { ClaudeSubprocess } from "../subprocess/manager.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
@@ -33,13 +34,88 @@ const RATE_LIMIT_PATTERNS = [
   /too many requests/i,
 ];
 
+const AUTH_ERROR_PATTERNS = [
+  /not logged in/i,
+  /please run \/login/i,
+  /run \/login/i,
+];
+
+const DISCORD_GENERAL_CHANNEL = "1475509846672674896";
+const AUTH_ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 min
+let lastAuthAlertAt = 0;
+
 function isRateLimitError(text: string): boolean {
   return RATE_LIMIT_PATTERNS.some((p) => p.test(text));
 }
 
+function isAuthError(text: string): boolean {
+  return AUTH_ERROR_PATTERNS.some((p) => p.test(text));
+}
+
+function getDiscordBotToken(): string | null {
+  if (process.env.DISCORD_BOT_TOKEN) {
+    return process.env.DISCORD_BOT_TOKEN;
+  }
+  try {
+    const configPath = path.resolve(
+      process.env.HOME ?? "/Users/tt",
+      ".openclaw/openclaw.json"
+    );
+    const config = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    const accounts = (config?.channels as Record<string, unknown>)
+      ?.discord as Record<string, unknown>;
+    const ttAccount = (accounts?.accounts as Record<string, unknown>)
+      ?.tt as Record<string, unknown>;
+    return (ttAccount?.token as string) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function notifyDiscordAuthError(message: string): void {
+  const now = Date.now();
+  if (now - lastAuthAlertAt < AUTH_ALERT_COOLDOWN_MS) {
+    console.error("[AuthAlert] Cooldown active, skipping notification");
+    return;
+  }
+  lastAuthAlertAt = now;
+
+  const token = getDiscordBotToken();
+  if (!token) {
+    console.error("[AuthAlert] No Discord bot token available");
+    return;
+  }
+
+  const content = `⚠️ **Claude CLI認証切れ検知**\nMac miniで \`claude\` を実行して \`/login\` してください。\n詳細: ${message.slice(0, 200)}`;
+  const postData = JSON.stringify({ content });
+  const options: https.RequestOptions = {
+    hostname: "discord.com",
+    port: 443,
+    path: `/api/v10/channels/${DISCORD_GENERAL_CHANNEL}/messages`,
+    method: "POST",
+    headers: {
+      "Authorization": `Bot ${token}`,
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(postData),
+    },
+  };
+
+  const req = https.request(options, (res) => {
+    res.on("data", () => {});
+    res.on("end", () => {
+      console.error(`[AuthAlert] Discord notification sent (status ${res.statusCode})`);
+    });
+  });
+  req.on("error", (err) => {
+    console.error("[AuthAlert] Failed to send Discord notification:", err.message);
+  });
+  req.write(postData);
+  req.end();
+}
+
 function writeErrorLog(
   requestId: string,
-  errorType: "rate_limit" | "other",
+  errorType: "rate_limit" | "auth_error" | "other",
   message: string,
   model: string,
   stream: boolean,
@@ -255,6 +331,13 @@ async function handleStreamingResponse(
         return;
       }
 
+      // Check result text for auth errors (auth errors come through result.result, not stderr)
+      if (result.result && isAuthError(result.result)) {
+        console.error("[Streaming] Auth error detected in result:", result.result.slice(0, 200));
+        writeErrorLog(requestId, "auth_error", result.result, lastModel, true, cliInput.sessionId, agent);
+        notifyDiscordAuthError(result.result);
+      }
+
       if (hasTools) {
         // Use the result text (more complete than streamed buffer)
         const resultText = result.result || fullTextBuffer;
@@ -332,7 +415,11 @@ async function handleStreamingResponse(
     });
 
     subprocess.on("stderr", (text: string) => {
-      if (isRateLimitError(text)) {
+      if (isAuthError(text)) {
+        console.error("[Streaming] Auth error detected in stderr:", text.slice(0, 200));
+        writeErrorLog(requestId, "auth_error", text, lastModel, true, cliInput.sessionId, agent);
+        notifyDiscordAuthError(text);
+      } else if (isRateLimitError(text)) {
         console.error("[Streaming] Rate limit detected in stderr:", text.slice(0, 200));
         writeErrorLog(requestId, "rate_limit", text, lastModel, true, cliInput.sessionId, agent);
       }
@@ -340,7 +427,8 @@ async function handleStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[Streaming] Error:", error.message);
-      const errorType = isRateLimitError(error.message) ? "rate_limit" : "other";
+      const errorType = isAuthError(error.message) ? "auth_error" : isRateLimitError(error.message) ? "rate_limit" : "other";
+      if (errorType === "auth_error") notifyDiscordAuthError(error.message);
       writeErrorLog(requestId, errorType, error.message, lastModel, true, cliInput.sessionId, agent);
       if (!res.writableEnded) {
         res.write(
@@ -393,10 +481,20 @@ async function handleNonStreamingResponse(
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       finalResult = result;
+      // Check result text for auth errors
+      if (result.result && isAuthError(result.result)) {
+        console.error("[NonStreaming] Auth error detected in result:", result.result.slice(0, 200));
+        writeErrorLog(requestId, "auth_error", result.result, "unknown", false, cliInput.sessionId, agent);
+        notifyDiscordAuthError(result.result);
+      }
     });
 
     subprocess.on("stderr", (text: string) => {
-      if (isRateLimitError(text)) {
+      if (isAuthError(text)) {
+        console.error("[NonStreaming] Auth error detected in stderr:", text.slice(0, 200));
+        writeErrorLog(requestId, "auth_error", text, "unknown", false, cliInput.sessionId, agent);
+        notifyDiscordAuthError(text);
+      } else if (isRateLimitError(text)) {
         console.error("[NonStreaming] Rate limit detected in stderr:", text.slice(0, 200));
         writeErrorLog(requestId, "rate_limit", text, "unknown", false, cliInput.sessionId, agent);
       }
@@ -404,7 +502,8 @@ async function handleNonStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[NonStreaming] Error:", error.message);
-      const errorType = isRateLimitError(error.message) ? "rate_limit" : "other";
+      const errorType = isAuthError(error.message) ? "auth_error" : isRateLimitError(error.message) ? "rate_limit" : "other";
+      if (errorType === "auth_error") notifyDiscordAuthError(error.message);
       writeErrorLog(requestId, errorType, error.message, "unknown", false, cliInput.sessionId, agent);
       res.status(500).json({
         error: {
