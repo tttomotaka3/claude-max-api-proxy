@@ -101,7 +101,7 @@ function notifyDiscordAuthError(message: string): void {
     return;
   }
 
-  const content = `⚠️ **Claude CLI認証切れ検知**\nMac miniで \`claude\` を実行して \`/login\` してください。\n詳細: ${message.slice(0, 200)}`;
+  const content = `⚠️ **Claude CLI認証切れ検知**\n\n**復旧手順:**\n1. Mac miniでターミナルを開く\n2. \`claude auth login\` を実行\n3. ブラウザが開くのでOAuth認証を完了\n4. ターミナルに「Successfully logged in」と表示されれば完了\n※ プロキシの再起動は不要（次のリクエストから新トークンが使われます）\n\n詳細: ${message.slice(0, 200)}`;
   const postData = JSON.stringify({ content });
   const options: https.RequestOptions = {
     hostname: "discord.com",
@@ -591,7 +591,7 @@ async function handleNonStreamingResponse(
 
     subprocess.on("close", (code: number | null) => {
       if (finalResult) {
-        writeUsageLog(requestId, finalResult, finalResult.modelUsage ? Object.keys(finalResult.modelUsage)[0] ?? "unknown" : "unknown", false, cliInput.hasTools);
+        writeUsageLog(requestId, finalResult, finalResult.modelUsage ? Object.keys(finalResult.modelUsage)[0] ?? "unknown" : "unknown", false, cliInput.hasTools, cliInput.sessionId, agent);
         res.json(cliResultToOpenai(finalResult, requestId, cliInput.hasTools));
       } else if (!res.headersSent) {
         res.status(500).json({
