@@ -728,6 +728,176 @@ export function handleUsage(req: Request, res: Response): void {
   }
 }
 
+// Model pricing constants (USD per 1M tokens)
+const MODEL_PRICING: Record<string, { input: number; output: number }> = {
+  "claude-opus-4":     { input: 15.00, output: 75.00 },
+  "claude-opus-4-6":   { input: 15.00, output: 75.00 },
+  "claude-sonnet-4":   { input:  3.00, output: 15.00 },
+  "claude-sonnet-4-6": { input:  3.00, output: 15.00 },
+  "claude-haiku-4":    { input:  0.80, output:  4.00 },
+  "claude-haiku-4-5":  { input:  0.80, output:  4.00 },
+};
+
+function calcCost(model: string, inputTokens: number, outputTokens: number): number {
+  const pricing = MODEL_PRICING[model] ?? { input: 3.00, output: 15.00 };
+  return (inputTokens * pricing.input + outputTokens * pricing.output) / 1_000_000;
+}
+
+function periodToDateRange(period: string): { from: string; to: string } {
+  const now = new Date();
+  const toStr = now.toISOString().slice(0, 10);
+  let fromDate: Date;
+  if (period === "monthly") {
+    fromDate = new Date(now.getFullYear(), now.getMonth(), 1);
+  } else if (period === "weekly") {
+    fromDate = new Date(now);
+    fromDate.setDate(now.getDate() - 6);
+  } else {
+    // daily: today
+    fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  }
+  return { from: fromDate.toISOString().slice(0, 10), to: toStr };
+}
+
+function readUsageLines(): Record<string, unknown>[] {
+  if (!fs.existsSync(LOG_FILE)) return [];
+  const lines = fs.readFileSync(LOG_FILE, "utf8").split("\n");
+  const entries: Record<string, unknown>[] = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      entries.push(JSON.parse(line) as Record<string, unknown>);
+    } catch {
+      // skip malformed lines
+    }
+  }
+  return entries;
+}
+
+/**
+ * Handle GET /api/usage/agents
+ *
+ * Returns per-agent usage breakdown (supports period=daily|weekly|monthly)
+ */
+export function handleUsageAgents(req: Request, res: Response): void {
+  const { period = "daily" } = req.query as Record<string, string | undefined>;
+  const { from, to } = periodToDateRange(period);
+
+  interface AgentBucket {
+    agent_id: string;
+    requests: number;
+    input_tokens: number;
+    output_tokens: number;
+    cost_usd: number;
+    by_model: Record<string, { requests: number; input_tokens: number; output_tokens: number; cost_usd: number }>;
+  }
+
+  const byAgent: Record<string, AgentBucket> = {};
+
+  try {
+    for (const entry of readUsageLines()) {
+      const ts = String(entry.timestamp ?? "");
+      const dateStr = ts.slice(0, 10);
+      if (dateStr < from || dateStr > to) continue;
+      if (entry.error) continue; // skip error entries
+
+      const agentId = String(entry.agent ?? "unknown");
+      const model = String(entry.model ?? "unknown");
+      const inputTokens = Number(entry.inputTokens ?? 0);
+      const outputTokens = Number(entry.outputTokens ?? 0);
+      const cost = Number(entry.totalCostUsd ?? 0) || calcCost(model, inputTokens, outputTokens);
+
+      if (!byAgent[agentId]) {
+        byAgent[agentId] = { agent_id: agentId, requests: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0, by_model: {} };
+      }
+      const ab = byAgent[agentId];
+      ab.requests++;
+      ab.input_tokens += inputTokens;
+      ab.output_tokens += outputTokens;
+      ab.cost_usd += cost;
+
+      if (!ab.by_model[model]) {
+        ab.by_model[model] = { requests: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0 };
+      }
+      ab.by_model[model].requests++;
+      ab.by_model[model].input_tokens += inputTokens;
+      ab.by_model[model].output_tokens += outputTokens;
+      ab.by_model[model].cost_usd += cost;
+    }
+
+    // Round costs
+    for (const ab of Object.values(byAgent)) {
+      ab.cost_usd = Math.round(ab.cost_usd * 1e8) / 1e8;
+      for (const mb of Object.values(ab.by_model)) {
+        mb.cost_usd = Math.round(mb.cost_usd * 1e8) / 1e8;
+      }
+    }
+
+    res.json({ period, from, to, agents: Object.values(byAgent) });
+  } catch (err) {
+    console.error("[handleUsageAgents] Error:", err);
+    res.status(500).json({ error: { message: "Failed to read usage log", type: "server_error", code: null } });
+  }
+}
+
+/**
+ * Handle GET /api/usage/cost
+ *
+ * Returns cost breakdown by agent and model (supports period=daily|weekly|monthly)
+ */
+export function handleUsageCost(req: Request, res: Response): void {
+  const { period = "daily" } = req.query as Record<string, string | undefined>;
+  const { from, to } = periodToDateRange(period);
+
+  let totalCostUsd = 0;
+  const byAgent: Record<string, { agent_id: string; cost_usd: number; input_tokens: number; output_tokens: number }> = {};
+  const byModel: Record<string, { model: string; cost_usd: number; input_tokens: number; output_tokens: number }> = {};
+
+  try {
+    for (const entry of readUsageLines()) {
+      const ts = String(entry.timestamp ?? "");
+      const dateStr = ts.slice(0, 10);
+      if (dateStr < from || dateStr > to) continue;
+      if (entry.error) continue;
+
+      const agentId = String(entry.agent ?? "unknown");
+      const model = String(entry.model ?? "unknown");
+      const inputTokens = Number(entry.inputTokens ?? 0);
+      const outputTokens = Number(entry.outputTokens ?? 0);
+      const cost = Number(entry.totalCostUsd ?? 0) || calcCost(model, inputTokens, outputTokens);
+
+      totalCostUsd += cost;
+
+      if (!byAgent[agentId]) byAgent[agentId] = { agent_id: agentId, cost_usd: 0, input_tokens: 0, output_tokens: 0 };
+      byAgent[agentId].cost_usd += cost;
+      byAgent[agentId].input_tokens += inputTokens;
+      byAgent[agentId].output_tokens += outputTokens;
+
+      if (!byModel[model]) byModel[model] = { model, cost_usd: 0, input_tokens: 0, output_tokens: 0 };
+      byModel[model].cost_usd += cost;
+      byModel[model].input_tokens += inputTokens;
+      byModel[model].output_tokens += outputTokens;
+    }
+
+    // Round costs
+    totalCostUsd = Math.round(totalCostUsd * 1e8) / 1e8;
+    for (const v of Object.values(byAgent)) v.cost_usd = Math.round(v.cost_usd * 1e8) / 1e8;
+    for (const v of Object.values(byModel)) v.cost_usd = Math.round(v.cost_usd * 1e8) / 1e8;
+
+    res.json({
+      period,
+      from,
+      to,
+      total_cost_usd: totalCostUsd,
+      by_agent: Object.values(byAgent).sort((a, b) => b.cost_usd - a.cost_usd),
+      by_model: Object.values(byModel).sort((a, b) => b.cost_usd - a.cost_usd),
+    });
+  } catch (err) {
+    console.error("[handleUsageCost] Error:", err);
+    res.status(500).json({ error: { message: "Failed to read usage log", type: "server_error", code: null } });
+  }
+}
+
 /**
  * Handle GET /v1/models
  *

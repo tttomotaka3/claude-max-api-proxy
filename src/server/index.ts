@@ -6,7 +6,7 @@
 
 import express, { Express, Request, Response, NextFunction } from "express";
 import { createServer, Server } from "http";
-import { handleChatCompletions, handleModels, handleHealth, handleUsage } from "./routes.js";
+import { handleChatCompletions, handleModels, handleHealth, handleUsage, handleUsageAgents, handleUsageCost } from "./routes.js";
 
 export interface ServerConfig {
   port: number;
@@ -49,6 +49,8 @@ function createApp(): Express {
   app.get("/health", handleHealth);
   app.get("/v1/models", handleModels);
   app.get("/v1/usage", handleUsage);
+  app.get("/api/usage/agents", handleUsageAgents);
+  app.get("/api/usage/cost", handleUsageCost);
   app.post("/v1/chat/completions", handleChatCompletions);
 
   // 404 handler
